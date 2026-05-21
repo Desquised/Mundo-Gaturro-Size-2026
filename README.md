@@ -301,6 +301,8 @@ El archivo `hosts` de Windows funciona como una agenda o directorio telefónico 
    ipconfig /flushdns
    ```
 
+### 1.1 Ejecutar Proxy Para Calcular Size E Inyectarlo
+
    El siguiente script en Python 3 es un proxy especialmente para generar el size en milisegundos sin tu hacer más nada que solo     ejecutarlo y dejarlo en segundo plano:
 
 ```python
@@ -416,6 +418,328 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+```
+
+### 1.2 Script Para Deserializar Procolo Mambos
+
+   El siguiente script en Python 3 es un deserializador de el protocolo Mambos fundamental para que el proxy funcione:
+
+```python
+import struct
+import binascii
+import zlib
+import logging
+
+log = logging.getLogger("MamboProtocol")
+
+class MamboProtocol:
+    """
+    Mambo Protocol SDK (Mundo Gaturro WebSocket Binary Protocol).
+    
+    Data Types:
+      'n' (0x6E) : Int32 (4 bytes)
+      'l' (0x6C) : Float32 (4 bytes)
+      't' (0x74) : String (4 bytes length + UTF-8 bytes)
+      'o' (0x6F) : Boolean (1 byte, 0 or 1)
+      'j' (0x6A) : Object (4 bytes property count + [type][key_length][key_string][value]...)
+      'J' (0x4A) : Mixed Array (4 bytes count + [type][value]...)
+      'N' (0x4E) : Int32 Array (4 bytes count + [int32]...)
+      'T' (0x54) : String Array (4 bytes count + [4 bytes length + UTF-8 bytes]...)
+      'L' (0x4C) : Float32 Array (4 bytes count + [float32]...)
+      'O' (0x4F) : Boolean Array (4 bytes count + [bool]...)
+      'Z' (0x5A) : ByteArray/Zlib Blob (4 bytes length + bytes)
+      0x00 / 'z' : Null/None (no payload)
+    """
+    
+    @staticmethod
+    def decode_packet(data: bytes) -> dict:
+        if len(data) < 5:
+            return {"raw": data, "error": "Packet too short"}
+        
+        header = data[0]
+        length = struct.unpack(">I", data[1:5])[0]
+        payload = data[5:]
+        
+        result = {
+            "header": header,
+            "length": length,
+            "raw_payload": payload,
+            "obj": None,
+        }
+        
+        if header == 3: # Main Mambo Object payload
+            try:
+                decoded_obj, _ = MamboProtocol.read_mobject(payload, 0)
+                result["obj"] = decoded_obj
+            except Exception as e:
+                log.error(f"Error decoding packet: {e}")
+                
+        return result
+
+    @staticmethod
+    def encode_packet(data_dict: dict, header_type: int = 3) -> bytes:
+        payload = MamboProtocol.write_mobject(data_dict)
+        packet = bytearray([header_type])
+        packet.extend(struct.pack(">I", len(payload)))
+        packet.extend(payload)
+        return bytes(packet)
+
+    @staticmethod
+    def read_mobject(data: bytes, offset: int = 0):
+        if offset + 4 > len(data):
+            return {}, offset
+        
+        count = struct.unpack(">I", data[offset : offset + 4])[0]
+        offset += 4
+        
+        obj = {}
+        for _ in range(count):
+            if offset + 1 > len(data):
+                break
+            
+            type_char = chr(data[offset])
+            offset += 1
+            
+            if offset + 4 > len(data):
+                break
+                
+            key_len = struct.unpack(">I", data[offset : offset + 4])[0]
+            offset += 4
+            
+            key = data[offset : offset + key_len].decode("utf-8", errors="ignore")
+            offset += key_len
+            
+            value, offset = MamboProtocol.read_value(data, offset, type_char)
+            obj[key] = value
+            
+        return obj, offset
+
+    @staticmethod
+    def read_value(data: bytes, offset: int, type_char: str):
+        try:
+            # NULL
+            if type_char == "\x00" or type_char == "z":
+                return None, offset
+
+            # INT32
+            if type_char == "n":
+                return struct.unpack(">i", data[offset:offset+4])[0], offset + 4
+
+            # FLOAT32
+            if type_char == "l":
+                return struct.unpack(">f", data[offset:offset+4])[0], offset + 4
+
+            # STRING
+            if type_char == "t":
+                l = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                s = data[offset:offset+l].decode("utf-8", errors="ignore")
+                offset += l
+                return s, offset
+
+            # BOOLEAN
+            if type_char == "o":
+                return data[offset] != 0, offset + 1
+
+            # OBJECT
+            if type_char == "j":
+                obj, offset = MamboProtocol.read_mobject(data, offset)
+                return obj, offset
+
+            # MIXED ARRAY
+            if type_char == "J":
+                count = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                arr = []
+                for _ in range(count):
+                    et = chr(data[offset])
+                    offset += 1
+                    val, offset = MamboProtocol.read_value(data, offset, et)
+                    arr.append(val)
+                return arr, offset
+
+            # INT ARRAY
+            if type_char == "N":
+                count = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                arr = []
+                for _ in range(count):
+                    val = struct.unpack(">i", data[offset:offset+4])[0]
+                    offset += 4
+                    arr.append(val)
+                return arr, offset
+
+            # STRING ARRAY
+            if type_char == "T":
+                count = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                arr = []
+                for _ in range(count):
+                    sl = struct.unpack(">I", data[offset:offset+4])[0]
+                    offset += 4
+                    s = data[offset:offset+sl].decode("utf-8", errors="ignore")
+                    offset += sl
+                    arr.append(s)
+                return arr, offset
+
+            # FLOAT ARRAY
+            if type_char == "L":
+                count = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                arr = []
+                for _ in range(count):
+                    val = struct.unpack(">f", data[offset:offset+4])[0]
+                    offset += 4
+                    arr.append(val)
+                return arr, offset
+
+            # BOOLEAN ARRAY
+            if type_char == "O":
+                count = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                arr = []
+                for _ in range(count):
+                    arr.append(data[offset] != 0)
+                    offset += 1
+                return arr, offset
+
+            # BYTEARRAY / ZLIB BLOB
+            if type_char == "Z":
+                l = struct.unpack(">I", data[offset:offset+4])[0]
+                offset += 4
+                blob = data[offset:offset+l]
+                offset += l
+                
+                # Accept all valid zlib headers: 0x78 0x01, 0x78 0x5E, 0x78 0x9C, 0x78 0xDA
+                if len(blob) >= 2 and blob[0] == 0x78 and blob[1] in (0x01, 0x5E, 0x9C, 0xDA):
+                    try:
+                        dec = zlib.decompress(blob)
+                        try:
+                            # Return with ZLIB: prefix so encoder preserves the Z type
+                            return "ZLIB:" + dec.decode("utf-8", errors="ignore"), offset
+                        except:
+                            return "HEX:" + blob.hex(), offset
+                    except:
+                        pass
+                return "HEX:" + blob.hex(), offset
+
+            # UNKNOWN TYPE CATCH-ALL
+            ctx_start = max(0, offset - 32)
+            ctx_end = min(len(data), offset + 32)
+            ctx = data[ctx_start:ctx_end]
+            hex_dump = " ".join([f"{b:02x}" for b in ctx])
+            
+            hex_type = f"{ord(type_char):02x}" if isinstance(type_char, str) and len(type_char) == 1 else "unknown"
+            log.error(f"====== TIPO DESCONOCIDO '{type_char}' (hex: {hex_type}) EN OFFSET {offset} ======")
+            log.error(f"CONTEXTO HEX (-32 a +32): {hex_dump}")
+            
+            return None, offset
+
+        except Exception as e:
+            log.error(f"Error parsing type {type_char} @ {offset}: {e}")
+
+        return None, offset
+
+    @staticmethod
+    def write_mobject(obj: dict) -> bytearray:
+        buf = bytearray(struct.pack(">I", len(obj)))
+        for k, v in obj.items():
+            # Override seguro para 'check' para preservar su tipo Z / Zlib Blob original
+            if k == "check" and isinstance(v, str) and not v.startswith("ZLIB:") and not v.startswith("HEX:"):
+                v = f"ZLIB:{v}"
+            
+            tc = MamboProtocol.infer_type(v)
+            buf.append(ord(tc))
+            kb = k.encode("utf-8")
+            buf.extend(struct.pack(">I", len(kb)))
+            buf.extend(kb)
+            buf.extend(MamboProtocol.write_value(v, tc))
+        return buf
+
+    @staticmethod
+    def infer_type(v) -> str:
+        if v is None:
+            return "\x00"
+        if isinstance(v, bool):
+            return "o"
+        if isinstance(v, int):
+            return "n"
+        if isinstance(v, float):
+            return "l"
+        if isinstance(v, str):
+            if v.startswith("HEX:") or v.startswith("ZLIB:"):
+                return "Z"
+            return "t"
+        if isinstance(v, dict):
+            return "j"
+        if isinstance(v, list):
+            if not v:
+                return "J"
+            if isinstance(v[0], dict):
+                return "J"
+            if isinstance(v[0], str):
+                return "T"
+            if isinstance(v[0], int):
+                return "N"
+            if isinstance(v[0], float):
+                return "L"
+            if isinstance(v[0], bool):
+                return "O"
+            return "J"
+        return "t"
+
+    @staticmethod
+    def write_value(v, tc: str) -> bytes:
+        if tc == "\x00" or tc == "z":
+            return b""
+        if tc == "n":
+            return struct.pack(">i", int(v))
+        if tc == "l":
+            return struct.pack(">f", float(v))
+        if tc == "t":
+            vb = str(v).encode("utf-8")
+            return struct.pack(">I", len(vb)) + vb
+        if tc == "o":
+            return bytes([1 if v else 0])
+        if tc == "j":
+            return MamboProtocol.write_mobject(v)
+        if tc == "J":
+            b = struct.pack(">I", len(v))
+            for x in v:
+                etc = MamboProtocol.infer_type(x)
+                b += etc.encode("utf-8") + MamboProtocol.write_value(x, etc)
+            return b
+        if tc == "T":
+            b = struct.pack(">I", len(v))
+            for x in v:
+                xb = str(x).encode("utf-8")
+                b += struct.pack(">I", len(xb)) + xb
+            return b
+        if tc == "N":
+            b = struct.pack(">I", len(v))
+            for x in v:
+                b += struct.pack(">i", int(x))
+            return b
+        if tc == "L":
+            b = struct.pack(">I", len(v))
+            for x in v:
+                b += struct.pack(">f", float(x))
+            return b
+        if tc == "O":
+            b = struct.pack(">I", len(v))
+            for x in v:
+                b += bytes([1 if x else 0])
+            return b
+        if tc == "Z":
+            if str(v).startswith("HEX:"):
+                raw_bytes = binascii.unhexlify(str(v)[4:])
+            elif str(v).startswith("ZLIB:"):
+                # Forzar level=9 para emular Flash ByteArray.compress() (genera 0x78 0xDA)
+                raw_bytes = zlib.compress(str(v)[5:].encode("utf-8"), level=9)
+            else:
+                raw_bytes = str(v).encode("utf-8")
+            return struct.pack(">I", len(raw_bytes)) + raw_bytes
+        return b""
 ```
 ---
 
