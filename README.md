@@ -273,33 +273,163 @@ Utiliza un proxy TCP/Websockets basado en Python que automatiza todo el proceso:
 
 ---
 
-### 4.2 Método B: Intercepción Dinámica en Windows (Fiddler & Python Script)
-En Windows, utilizaremos **Fiddler Classic** como proxy del sistema para el desvío HTTP y un script de Python de soporte para manejar el handshake TCP/Websocket en tiempo de ejecución:
+### 4.2 Método B: Redirección mediante el archivo Hosts + Proxy Local WINDOWS
 
-1.  **Configurar Fiddler AutoResponder (Desvío del SWF)**:
-    *   Abre **Fiddler Classic**.
-    *   En la pestaña **AutoResponder**, activa **Enable rules** y **Unmatched requests passthrough**.
-    *   Crea una regla con el patrón regex:
-        `REGEX:(?i)cdn-ar\.mundogaturro\.com/juego/MMO.*\.swf`
-    *   En la acción, apunta a tu archivo local en disco:
-        `C:\Ruta\Hacia\encrypted_mmo_nuevito.swf`
-2.  **Configurar Fiddler Script para Captura de Nonce y Login en Runtime**:
-    Para automatizar el cálculo del `size` y evitar desconexiones, utilizaremos las capacidades de intercepción de Websockets en Fiddler:
-    *   Ve a la pestaña **FiddlerScript**.
-    *   Busca el método `OnWebSocketMessage` y agrega la lógica de captura:
-        ```csharp
-        static function OnWebSocketMessage(oWSS: WebSocketSession, oMsg: WebSocketMessage) {
-            // 1. Detectar el Nonce enviado por el servidor (C->S / PreLogin)
-            if (oMsg.IsOutbound == false && oMsg.PayloadAsString().Contains("nonce")) {
-                FiddlerApplication.Log.LogString("Nonce Detectado: " + oMsg.PayloadAsString());
-            }
-            // 2. Detectar e inyectar el size en el paquete de login del cliente
-            if (oMsg.IsOutbound == true && oMsg.PayloadAsString().Contains("\"request\":\"LoginActionRequest\"")) {
-                // Interceptar, parsear JSON, re-calcular size en runtime e inyectar
-                FiddlerApplication.Log.LogString("Login detectado. Inyectando atestación size...");
-            }
-        }
-        ```
-3.  **Alternativa Híbrida en Windows (Python Proxy + Fiddler)**:
-    Si prefieres delegar la lógica criptográfica compleja en Python, puedes levantar tu script de proxy local (`proxy.py` escuchando en `127.0.0.1:8888`) y configurar a Fiddler para que enrute todo el tráfico de socket directamente a tu script local. 
-    Esto te permite usar exactamente la misma biblioteca criptográfica y flujo de atestación del bot en cualquier sistema operativo de manera uniforme.
+El archivo `hosts` de Windows funciona como una agenda o directorio telefónico local: permite asignar nombres de dominio a direcciones IP manualmente, obligando a tu computadora a redirigir el tráfico hacia donde vos decidas **antes** de consultar a los servidores DNS tradicionales.
+
+#### Paso 1 — Editar el archivo hosts
+
+1. Abrí el **Bloc de notas como administrador**:
+   - Presioná `Win`, escribí **Bloc de notas**, clic derecho → **Ejecutar como administrador**.
+
+2. Desde el Bloc de notas, andá a **Archivo → Abrir** y navegá a:
+   ```
+   C:\Windows\System32\drivers\etc
+   ```
+   Cambiá el filtro a **Todos los archivos (`*.*`)**, seleccioná **hosts** y abrilo.
+
+3. Al final del archivo, agregá estas dos líneas:
+   ```
+   127.0.0.1    juegosg07.mundogaturro.com
+   127.0.0.1    juegosg01.mundogaturro.com
+   ```
+
+4. Guardá con `Ctrl + S`. Si da error de permisos, repetí desde el paso 1 asegurándote de abrir el Bloc de notas como administrador.
+
+5. Limpiá la caché DNS para que el cambio tome efecto:
+   ```
+   ipconfig /flushdns
+   ```
+
+   El siguiente script en Python 3 es un proxy especialmente para generar el size en milisegundos sin tu hacer más nada que solo     ejecutarlo y dejarlo en segundo plano:
+
+```python
+import asyncio
+import struct
+import sys
+import os
+import json
+import hashlib
+
+sys.path.append(os.getcwd())
+try:
+    from mambo_protocol import MamboProtocol
+except ImportError:
+    print("[!] Error: No se encontró mambo_protocol.py.")
+    sys.exit(1)
+
+SO_ORIGINAL_DST = 80
+
+K_BYTES = bytes.fromhex("c733bd4af38b1253ed8e2b893816f1ea2ada05d9ab2d6c51d2664709cf155e91")
+
+class SimpleProxy:
+    def __init__(self):
+        self.nonce = None
+
+    async def handle_connection(self, reader, writer):
+        import socket
+        sock = writer.get_extra_info('socket')
+        try:
+            odst = sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16)
+            _, port, a1, a2, a3, a4 = struct.unpack("!HHBBBB", odst[:8])
+            real_ip = f"{a1}.{a2}.{a3}.{a4}"
+        except:
+            real_ip, port = "34.0.59.203", 9899
+
+        try:
+            peek_data = await reader.read(5)
+            if peek_data.startswith(b"<poli"):
+                writer.write(b'<?xml version="1.0"?><cross-domain-policy><allow-access-from domain="*" to-ports="*" /></cross-domain-policy>\0')
+                await writer.drain()
+                writer.close()
+                return
+
+            remote_reader, remote_writer = await asyncio.open_connection(real_ip, port)
+            nonce_store = {"nonce": None}
+
+            async def forward(src_reader, dst_writer, direction, first_chunk):
+                try:
+                    header = first_chunk
+                    while True:
+                        if len(header) < 5:
+                            header += await src_reader.readexactly(5 - len(header))
+                        payload = await src_reader.readexactly(struct.unpack(">I", header[1:5])[0])
+                        full_packet = header + payload
+                        packet = MamboProtocol.decode_packet(full_packet)
+
+                        if packet.get("obj"):
+                            mobj = packet["obj"].get("mobject", packet["obj"])
+                            m_type = mobj.get("request") or mobj.get("type")
+
+                            # Capturar nonce del servidor
+                            if direction == "S->C" and m_type == "PreLoginActionResponse":
+                                nonce_store["nonce"] = mobj.get("nonce")
+                                print(f"[*] Nonce capturado: {nonce_store['nonce']}")
+
+                            # Calcular e inyectar size en el login
+                            if direction == "C->S" and m_type == "login":
+                                login_id = mobj.get("hash")
+                                nonce = nonce_store.get("nonce")
+
+                                if login_id and nonce:
+                                    buf = bytearray()
+                                    buf.extend(login_id.encode('ascii'))
+                                    buf.extend(nonce.encode('ascii'))
+                                    buf.extend(K_BYTES)
+
+                                    size_hex = hashlib.sha256(buf).digest().hex()
+                                    mobj["size"] = "HEX:" + size_hex
+                                    full_packet = MamboProtocol.encode_packet(packet["obj"], packet.get("header"))
+                                    print(f"[+] size inyectado: {size_hex}")
+                                else:
+                                    print("[!] Login detectado pero falta hash o nonce.")
+
+                        dst_writer.write(full_packet)
+                        await dst_writer.drain()
+                        header = await src_reader.readexactly(5)
+
+                except Exception as e:
+                    print(f"[!] forward {direction} cerrado: {e}")
+                finally:
+                    dst_writer.close()
+
+            await asyncio.gather(
+                forward(reader, remote_writer, "C->S", peek_data),
+                forward(remote_reader, writer, "S->C", b"")
+            )
+
+        except Exception as e:
+            print(f"[!] Conexión fallida: {e}")
+        finally:
+            writer.close()
+
+
+async def main():
+    proxy = SimpleProxy()
+    server = await asyncio.start_server(proxy.handle_connection, '0.0.0.0', 9899)
+    server2 = await asyncio.start_server(proxy.handle_connection, '0.0.0.0', 9898)
+    print("[*] Proxy escuchando en :9898 y :9899")
+    await asyncio.gather(server.serve_forever(), server2.serve_forever())
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+```
+---
+
+#### Paso 2 — Cómo funciona la redirección
+
+Cuando el juego intente conectarse a `juegosg07` o `juegosg01`, en lugar de llegar al servidor real, va a resolver a `127.0.0.1` (tu propia máquina). A partir de ahí:
+
+- Arrancás tu servidor/proxy local escuchando en el **puerto 9899**.
+- El juego, al ser redirigido a `127.0.0.1`, se conecta a ese puerto y **tu proxy recibe la conexión**.
+- Todo lo que el cliente envía pasa por el proxy, que lo reenvía al servidor real, y viceversa.
+- Podés **filtrar paquetes** en cualquier dirección (cliente → servidor o servidor → cliente) y decidir qué dejás pasar, qué modificás o qué descartás.
+
+#### Paso 3 — Resultado
+
+Una vez que el proxy esté escuchando los sockets WSS de esos servidores, la redirección opera de forma automática: toda la comunicación del juego fluye por tu proxy y podés inspeccionar los paquetes en tiempo real.
+
+> Para revertir, eliminá o comentá las líneas en `hosts` (poniendo `#` al inicio) y volvé a ejecutar `ipconfig /flushdns`.
