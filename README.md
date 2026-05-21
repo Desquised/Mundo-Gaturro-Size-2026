@@ -20,6 +20,131 @@ Donde:
 ### 1.2 La Firma Constante $K$
 Debido a que el cálculo de $K$ es estático (no depende de parámetros dinámicos del servidor, sino de las propiedades binarias de los archivos descargados), este valor se mantiene constante para cada versión específica del juego. 
 
+### Script Para Generar $K$:
+Este script funciona de forma automática para obtener el valor $K$ de cada MMO actualizado:
+
+```python
+#!/usr/bin/env python3
+# Devuelve SOLO la última K limpia
+
+import struct
+import zlib
+import hashlib
+import urllib.request
+
+LOADER_URL = "http://cdn-ar.mundogaturro.com/juego/MMOLoader.swf"
+MMO_URL = "http://cdn-ar.mundogaturro.com/juego/MMO.swf"
+
+
+def download(url):
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
+    with urllib.request.urlopen(req) as r:
+        return r.read()
+
+
+def parse_swf(data):
+    if data[:3] == b"CWS":
+        body = zlib.decompress(data[8:])
+        return (
+            data[:8].replace(b"CWS", b"FWS") + body,
+            len(data),
+            len(body) + 8
+        )
+    return data, len(data), len(data)
+
+
+def decrypt_mmo(data, lc, ld):
+    body = data[32:]
+
+    acc = ""
+    for n in (len(body), lc, ld):
+        for d in str(n):
+            acc += chr(int(d) + 11)
+
+    key = hashlib.sha256(acc.encode()).digest()
+    ks = hashlib.sha256(key).digest()
+
+    return bytes(
+        b ^ ks[i % 32]
+        for i, b in enumerate(body)
+    )
+
+
+def b36(n):
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    s = ""
+    while n:
+        s = chars[n % 36] + s
+        n //= 36
+    return s or "0"
+
+
+def calc_k(mmo, lc, ld, crypted_size, mmo_comp):
+    if mmo[:3] == b"CWS":
+        body = zlib.decompress(mmo[8:])
+        mmo = mmo[:8].replace(b"CWS", b"FWS") + body
+
+    mmo_decomp = len(mmo)
+    frag_len = mmo_decomp // 4
+    frag = mmo[:frag_len]
+
+    h = hashlib.sha256(hashlib.sha256(frag).digest()).digest()
+
+    primes = [101, 103, 107, 109, 113, 127, 131, 137]
+    MOD = 1000000007
+    slots = [0, 0, 0, 0]
+
+    for i, b in enumerate(h):
+        slots[i % 4] = (
+            slots[i % 4] + b * primes[i % 8]
+        ) % MOD
+
+    mask16 = (
+        frag_len +
+        mmo_decomp +
+        ld +
+        lc +
+        crypted_size +
+        mmo_comp
+    ) & 0xFFFF
+
+    for i in range(4):
+        slots[i] = (slots[i] ^ mask16) % MOD
+
+    base = "".join(b36(x) for x in slots)
+
+    T = str(frag_len + ld + lc).encode()
+    M = hashlib.sha256(base.encode()).digest()
+
+    K = bytes(
+        M[i] ^ T[i % len(T)]
+        for i in range(len(M))
+    )
+
+    return hashlib.sha256(K).hexdigest()
+
+
+loader = download(LOADER_URL)
+crypted = download(MMO_URL)
+
+_, lc, ld = parse_swf(loader)
+
+mmo = decrypt_mmo(crypted, lc, ld)
+
+print(
+    calc_k(
+        mmo,
+        lc,
+        ld,
+        len(crypted),
+        len(mmo)
+    )
+)
+```
+
 Cuando el CDN actualiza sus archivos, los tamaños de los binarios varían y la constante $K$ debe ser recalculada.
 
 ### 1.3 Procedimiento de Obtención de la Constante $K$
