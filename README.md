@@ -123,6 +123,132 @@ if __name__ == "__main__":
         build_compatible_swf(sys.argv[1], sys.argv[2])
 ```
 
+## 3.2 Algoritmo de Desempaquetado Automático (Python 3)
+
+El siguiente script en Python 3 automatiza el descifrado y la descompresión del binario protegido MMO.swf, removiendo la cabecera HMAC y revirtiendo el cifrado XOR cíclico para dejar el archivo completamente limpio y listo para su análisis en descompiladores como FFDec (JPEXS):
+
+```python
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import struct
+import zlib
+import hashlib
+import hmac
+def parse_swf_sizes(swf_path):
+    """
+    Parsea un archivo SWF para obtener su tamaño en disco (comprimido)
+    y su tamaño real una vez descomprimido en RAM.
+    """
+    if not os.path.exists(swf_path):
+        raise FileNotFoundError(f"Loader no encontrado en: {swf_path}")
+        
+    with open(swf_path, "rb") as f:
+        data = f.read()
+        
+    comp_size = len(data)
+    if comp_size < 8:
+        raise ValueError("El archivo SWF es demasiado pequeño o está corrupto.")
+        
+    sig = data[:3]
+    # El tamaño descomprimido se guarda como entero de 32 bits Little Endian en los bytes 4-7
+    decomp_size = struct.unpack("<I", data[4:8])[0]
+    
+    return comp_size, decomp_size
+def auto_decompress_swf(data):
+    """
+    Detecta si el SWF está comprimido (CWS) y lo infla a formato plano (FWS)
+    para facilitar su lectura directa en FFDec.
+    """
+    if len(data) < 8:
+        return data
+    
+    sig = data[:3]
+    if sig == b"CWS":
+        print("[*] Detectado SWF comprimido (CWS). Descomprimiendo en memoria...")
+        try:
+            body = zlib.decompress(data[8:])
+            # Reconstruir cabecera FWS (descomprimida) con la firma modificada
+            header = b"FWS" + data[3:8]
+            return header + body
+        except zlib.error as e:
+            print(f"[!] Advertencia: No se pudo descomprimir el cuerpo Zlib ({e}). Se guardará cifrado.")
+    return data
+def decrypt_mmo(input_path, output_path, loader_path=None):
+    if not os.path.exists(input_path):
+        print(f"[-] Error: Archivo de entrada {input_path} no encontrado.")
+        return
+    with open(input_path, "rb") as f:
+        data = f.read()
+    file_size = len(data)
+    if file_size < 32:
+        print("[!] Error: El archivo es demasiado corto para contener un HMAC válido.")
+        return
+    # 1. Separar la cabecera HMAC de 32 bytes del cuerpo encriptado
+    original_hmac = data[:32]
+    ciphertext = data[32:]
+    n1 = len(ciphertext)
+    # 2. Obtener variables del Loader (dinámicas o fallback por defecto)
+    if loader_path:
+        try:
+            n2, n3 = parse_swf_sizes(loader_path)
+            print(f"[+] Parámetros dinámicos del Loader extraídos de '{loader_path}':")
+        except Exception as e:
+            print(f"[!] Error al parsear el Loader ({e}). Usando valores por defecto.")
+            n2, n3 = 98298, 253358
+    else:
+        # Valores por defecto de la versión estable de Mundo Gaturro
+        n2 = 98298      # loaderInfo.bytesTotal
+        n3 = 253358     # loaderInfo.bytes.length
+        print("[*] Usando parámetros de Loader por defecto (hardcoded):")
+        
+    print(f"    - n1 (Cuerpo MMO): {n1} bytes")
+    print(f"    - n2 (Loader Comprimido): {n2} bytes")
+    print(f"    - n3 (Loader Descomprimido): {n3} bytes")
+    # 3. Derivación de la clave a través del acumulador decimal (+11 ASCII)
+    acc = ""
+    for n in (n1, n2, n3):
+        for digit in str(n):
+            acc += chr(int(digit) + 11)
+    hmac_key = hashlib.sha256(acc.encode('utf-8')).digest()
+    keystream = hashlib.sha256(hmac_key).digest()
+    # 4. Validación estricta del HMAC (Seguridad e Integridad)
+    expected_message = struct.pack(">III", n1, n3, n2)
+    computed_hmac = hmac.new(hmac_key, expected_message, hashlib.sha256).digest()
+    if computed_hmac != original_hmac:
+        print("[!] ADVERTENCIA: La firma HMAC calculada no coincide con la original.")
+        print(f"    - Esperada: {computed_hmac.hex()}")
+        print(f"    - Recibida: {original_hmac.hex()}")
+        print("    [?] Esto suele significar que los pesos del Loader (n2, n3) no son los correctos.")
+    else:
+        print("[+] Integridad verificada: ¡Firma HMAC válida!")
+    # 5. Descifrado XOR Cíclico en memoria
+    print("[*] Descifrando cuerpo binario...")
+    plaintext = bytearray(n1)
+    for i in range(n1):
+        plaintext[i] = ciphertext[i] ^ keystream[i % 32]
+    # 6. Descompresión automática e inyección en disco
+    final_swf = auto_decompress_swf(bytes(plaintext))
+    with open(output_path, "wb") as f:
+        f.write(final_swf)
+    magic = final_swf[:3].decode('utf-8', errors='ignore')
+    print(f"[+++] PROCESO COMPLETADO: Guardado en '{output_path}'")
+    print(f"      Firma final: {magic} | Tamaño final: {len(final_swf)} bytes (Listo para FFDec)")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Extractor y descifrador inteligente de MMO.swf para Mundo Gaturro."
+    )
+    parser.add_argument("input", help="Ruta al MMO.swf cifrado original.")
+    parser.add_argument("output", help="Ruta de destino del SWF descifrado final.")
+    parser.add_argument(
+        "-l", "--loader", 
+        help="Ruta al MMOLoader.swf actual del CDN para extraer parámetros automáticamente (opcional).",
+        default=None
+    )
+    args = parser.parse_args()
+    decrypt_mmo(args.input, args.output, args.loader)
+```
 ---
 
 ## 4. Redirección de Red e Intercepción Dinámica (Linux & Windows)
